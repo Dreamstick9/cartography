@@ -15,6 +15,102 @@ TEST_REGION = "us-east-1"
 TEST_UPDATE_TAG = 123456789
 
 
+@patch.object(
+    cartography.intel.aws.route53,
+    "get_zones",
+    return_value=GET_ZONES_SAMPLE_RESPONSE,
+)
+def test_sync_route53_creates_ip_nodes_for_a_records(mock_get_zones, neo4j_session):
+    """
+    Regression test for TODO in cartography/intel/aws/route53.py around line 238:
+    "consider creating IPs as a first-class node from here."
+
+    Before the fix, the ``AWSDNSRecordToIpRel`` schema declared
+    ``(:AWSDNSRecord)-[:DNS_POINTS_TO]->(:Ip)`` but no code in route53.py
+    ever materialized the target ``Ip`` nodes. The matchlinks therefore
+    pointed at non-existent nodes, leaving DNS→IP traversals empty in
+    production graphs. Older tests masked this by manually MERGE-ing the
+    ``Ip`` nodes in setup; this test runs the sync with no manual setup
+    and asserts the Ip nodes get created by the route53 sync itself.
+    """
+    # Arrange: only the AWS account exists — no Ip pre-creation.
+    boto3_session = MagicMock()
+    create_test_account(neo4j_session, TEST_ACCOUNT_ID, TEST_UPDATE_TAG)
+
+    # Act: run the public sync() entry point.
+    sync(
+        neo4j_session,
+        boto3_session,
+        [TEST_REGION],
+        TEST_ACCOUNT_ID,
+        TEST_UPDATE_TAG,
+        {"UPDATE_TAG": TEST_UPDATE_TAG, "AWS_ID": TEST_ACCOUNT_ID},
+    )
+
+    # Assert: Ip nodes materialized from the A/AAAA records in the fixture.
+    # GET_ZONES_SAMPLE_RESPONSE contains:
+    #   - A     record example.com       -> 1.2.3.4
+    #   - AAAA  record ipv6.example.com  -> 2001:db8::1, 2001:db8::2
+    expected_ips = {
+        ("1.2.3.4",),
+        ("2001:db8::1",),
+        ("2001:db8::2",),
+    }
+    assert (
+        check_nodes(neo4j_session, "Ip", ["id"]) == expected_ips
+    ), "route53 sync must create Ip nodes from A/AAAA records"
+
+
+@patch.object(
+    cartography.intel.aws.route53,
+    "get_zones",
+    return_value=GET_ZONES_SAMPLE_RESPONSE,
+)
+def test_sync_route53_a_records_point_to_ip_nodes(mock_get_zones, neo4j_session):
+    """
+    Companion to test_sync_route53_creates_ip_nodes_for_a_records.
+    Asserts that the ``DNS_POINTS_TO`` relationship from an AWSDNSRecord
+    to an Ip node is materialized with the correct update tag baked in.
+    """
+    # Arrange
+    boto3_session = MagicMock()
+    create_test_account(neo4j_session, TEST_ACCOUNT_ID, TEST_UPDATE_TAG)
+
+    # Act
+    sync(
+        neo4j_session,
+        boto3_session,
+        [TEST_REGION],
+        TEST_ACCOUNT_ID,
+        TEST_UPDATE_TAG,
+        {"UPDATE_TAG": TEST_UPDATE_TAG, "AWS_ID": TEST_ACCOUNT_ID},
+    )
+
+    # Assert: the example.com A record points at its single IP.
+    assert check_rels(
+        neo4j_session,
+        "AWSDNSRecord",
+        "id",
+        "Ip",
+        "id",
+        "DNS_POINTS_TO",
+        rel_direction_right=True,
+    ) == {
+        (
+            "/hostedzone/HOSTED_ZONE/example.com/A",
+            "1.2.3.4",
+        ),
+        (
+            "/hostedzone/HOSTED_ZONE/ipv6.example.com/AAAA",
+            "2001:db8::1",
+        ),
+        (
+            "/hostedzone/HOSTED_ZONE/ipv6.example.com/AAAA",
+            "2001:db8::2",
+        ),
+    }
+
+
 def _ensure_local_neo4j_has_test_ec2_records(neo4j_session):
     cartography.intel.aws.ec2.load_balancer_v2s.load_load_balancer_v2s(
         neo4j_session,

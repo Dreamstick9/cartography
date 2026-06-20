@@ -9,8 +9,10 @@ import neo4j
 from cartography.client.core.tx import load
 from cartography.client.core.tx import load_matchlinks
 from cartography.client.core.tx import read_list_of_dicts_tx
+from cartography.client.core.tx import run_write_query
 from cartography.graph.job import GraphJob
 from cartography.intel.aws.util.botocore_config import create_boto3_client
+from cartography.intel.dns import _link_ip_to_A_record
 from cartography.models.aws.route53.dnsrecord import AWSDNSRecordSchema
 from cartography.models.aws.route53.nameserver import NameServerSchema
 from cartography.models.aws.route53.subzone import AWSDNSZoneSubzoneMatchLink
@@ -331,6 +333,7 @@ def load_a_records(
         lastupdated=update_tag,
         AWS_ID=current_aws_id,
     )
+    _link_record_ips(neo4j_session, records, update_tag)
 
 
 @timeit
@@ -347,6 +350,45 @@ def load_aaaa_records(
         lastupdated=update_tag,
         AWS_ID=current_aws_id,
     )
+    _link_record_ips(neo4j_session, records, update_tag)
+
+
+@timeit
+def _link_record_ips(
+    neo4j_session: neo4j.Session,
+    records: list[dict[str, Any]],
+    update_tag: int,
+) -> None:
+    """
+    For every A/AAAA record, materialize its IP addresses as ``Ip`` nodes via
+    ``_link_ip_to_A_record`` so the schema-declared ``DNS_POINTS_TO`` edges
+    resolve to real nodes instead of dangling.
+
+    The aws-route53 module already declares ``AWSDNSRecordToIpRel`` targeting
+    the ``Ip`` label; without this hook the relationship target nodes were
+    never created, leaving point-in-time graph queries on A records'
+    IPs empty.
+
+    Idempotent: ``_link_ip_to_A_record`` uses ``MERGE`` keyed by IP address.
+    """
+    for record in records:
+        ip_addresses = record.get("ip_addresses")
+        if not ip_addresses:
+            continue
+        record_id = record.get("id")
+        if not record_id:
+            # Schema declares id as required, but be defensive; log and skip.
+            logger.warning(
+                "Skipping IP link for DNS record without id: %r",
+                record.get("name"),
+            )
+            continue
+        _link_ip_to_A_record(
+            neo4j_session,
+            update_tag,
+            ip_addresses,
+            record_id,
+        )
 
 
 @timeit
@@ -497,6 +539,40 @@ def cleanup_route53(
         current_aws_id,
         update_tag,
     ).run(neo4j_session)
+
+    # Sweep Ip nodes that are no longer referenced by any AWSDNSRecord
+    # under this AWS account. We restrict the scope to AWS-owned records
+    # so we don't wipe Ip nodes created by other intel modules (e.g.
+    # elasticsearch's ingest_dns_record_by_fqdn).
+    _cleanup_orphaned_a_record_ips(neo4j_session, current_aws_id, update_tag)
+
+
+@timeit
+def _cleanup_orphaned_a_record_ips(
+    neo4j_session: neo4j.Session,
+    current_aws_id: str,
+    update_tag: int,
+) -> None:
+    """Delete ``Ip`` nodes that this route53 sync previously created but that
+    are no longer the target of any ``(AWSDNSRecord)-[:DNS_POINTS_TO]->(:Ip)``
+    edge within this AWS account.
+
+    Scoped to the current ``AWSAccount`` so unrelated ``Ip`` producers
+    (e.g. elasticsearch ingestion) are unaffected. ``lastupdated`` was set
+    by ``_link_ip_to_A_record`` on every sync, so we can scope by it.
+    """
+    query = """
+    MATCH (:AWSAccount{id: $AWS_ID})-[:RESOURCE]->(r:AWSDNSRecord)
+        -[rel:DNS_POINTS_TO]->(ip:Ip)
+    WHERE rel.lastupdated <> $UPDATE_TAG
+    DETACH DELETE ip
+    """
+    run_write_query(
+        neo4j_session,
+        query,
+        AWS_ID=current_aws_id,
+        UPDATE_TAG=update_tag,
+    )
 
 
 @timeit
